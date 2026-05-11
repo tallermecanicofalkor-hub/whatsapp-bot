@@ -2,8 +2,6 @@ require('dotenv').config();
 
 const required = [
   'WHATSAPP_PROVIDER',
-  'GOOGLE_CLIENT_EMAIL',
-  'GOOGLE_PRIVATE_KEY',
   'GOOGLE_CALENDAR_ID',
 ];
 
@@ -16,6 +14,22 @@ function validate() {
 
 validate();
 
+function parseGoogleCredentials() {
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    try {
+      const sa = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+      return { clientEmail: sa.client_email, privateKey: sa.private_key };
+    } catch (e) {
+      console.error('[env] GOOGLE_SERVICE_ACCOUNT_JSON inválido:', e.message);
+    }
+  }
+  // fallback a variables individuales
+  return {
+    clientEmail: process.env.GOOGLE_CLIENT_EMAIL,
+    privateKey: (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+  };
+}
+
 const env = {
   port: parseInt(process.env.PORT || '3000', 10),
 
@@ -27,8 +41,7 @@ const env = {
   },
 
   google: {
-    clientEmail: process.env.GOOGLE_CLIENT_EMAIL,
-    privateKey: (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+    ...parseGoogleCredentials(),
     calendarId: process.env.GOOGLE_CALENDAR_ID,
   },
 
