@@ -16,6 +16,7 @@ function getOrCreate(phone) {
         problemDescription: null,
         canMove: null,
         preferredDate: null,
+        preferredTimeOfDay: null,
         offeredSlots: [],
         selectedSlot: null,
         durationHours: null,

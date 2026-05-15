@@ -32,7 +32,7 @@ function overlaps(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && bStart < aEnd;
 }
 
-async function findAvailableSlots(durationHours, preferredDate, maxSuggestions = 3) {
+async function findAvailableSlots(durationHours, preferredDate, maxSuggestions = 3, options = {}) {
   if (!durationHours) return [];
 
   let cursor = preferredDate
@@ -55,13 +55,15 @@ async function findAvailableSlots(durationHours, preferredDate, maxSuggestions =
 
     const { start: dayStart, end: dayEnd } = workDayBounds(day);
 
-    let slotStart = dayStart;
+    const bounds = applyTimeOfDay(dayStart, dayEnd, options.timeOfDay);
+    let slotStart = bounds.start;
+    const slotLimit = bounds.end;
     if (day.hasSame(now(), 'day') && now() > slotStart) {
       // redondear a la próxima hora
       slotStart = now().plus({ hours: 1 }).set({ minute: 0, second: 0, millisecond: 0 });
     }
 
-    while (slotStart.plus({ hours: durationHours }) <= dayEnd) {
+    while (slotStart.plus({ hours: durationHours }) <= slotLimit) {
       const slotEnd = slotStart.plus({ hours: durationHours });
 
       const conflict = busy.some((b) => overlaps(slotStart, slotEnd, b.start, b.end));
@@ -81,6 +83,31 @@ async function findAvailableSlots(durationHours, preferredDate, maxSuggestions =
   return slots;
 }
 
+function applyTimeOfDay(dayStart, dayEnd, timeOfDay) {
+  if (timeOfDay === 'morning') {
+    return {
+      start: dayStart,
+      end: DateTime.min(dayEnd, dayStart.set({ hour: 12, minute: 0 })),
+    };
+  }
+
+  if (timeOfDay === 'afternoon') {
+    return {
+      start: DateTime.max(dayStart, dayStart.set({ hour: 12, minute: 0 })),
+      end: dayEnd,
+    };
+  }
+
+  if (timeOfDay === 'evening') {
+    return {
+      start: DateTime.max(dayStart, dayStart.set({ hour: 16, minute: 0 })),
+      end: dayEnd,
+    };
+  }
+
+  return { start: dayStart, end: dayEnd };
+}
+
 async function validateSlotAvailability(startDateTime, durationHours) {
   const start = DateTime.fromISO(startDateTime, { zone: TZ });
   const end = start.plus({ hours: durationHours });
@@ -92,16 +119,21 @@ async function createAppointmentEvent(data) {
   const calendar = getCalendarClient();
   const start = DateTime.fromISO(data.startISO, { zone: TZ });
   const end = start.plus({ hours: data.durationHours });
+  const vehicle = data.vehicle || 'No solicitado';
+  const problemDescription = data.problemDescription || 'No especificado';
+  const canMove = data.canMove === null || data.canMove === undefined
+    ? 'No solicitado'
+    : data.canMove ? 'Sí' : 'No';
 
-  const summary = `Turno taller - ${data.name} - ${data.vehicle}`;
+  const summary = `Turno taller - ${data.name}`;
   const description = [
     `Cliente: ${data.name}`,
     `WhatsApp: ${data.phone}`,
-    `Vehículo: ${data.vehicle}`,
-    `Problema: ${data.problemDescription}`,
+    `Vehículo: ${vehicle}`,
+    `Problema: ${problemDescription}`,
     `Duración estimada: ${data.durationHours} horas`,
     `Complejidad: ${data.complexity}`,
-    `¿Se puede mover?: ${data.canMove ? 'Sí' : 'No'}`,
+    `¿Se puede mover?: ${canMove}`,
     `Creado: ${now().toISO()}`,
     '',
     'Conversación relevante:',

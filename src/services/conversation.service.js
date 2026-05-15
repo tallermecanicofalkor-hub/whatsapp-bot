@@ -7,12 +7,14 @@ const {
 } = require('./duration.service');
 const calendarService = require('./calendar.service');
 const appointmentService = require('./appointment.service');
+const aiService = require('./openai.service');
 const { parseVehicle, normalize } = require('../utils/text.utils');
 const { formatHuman, DateTime, TZ, now } = require('../utils/date.utils');
 const env = require('../config/env');
 
 const STEPS = {
   START: 'START',
+  ASK_CONSENT: 'ASK_CONSENT',
   ASK_NAME: 'ASK_NAME',
   ASK_VEHICLE: 'ASK_VEHICLE',
   ASK_PROBLEM: 'ASK_PROBLEM',
@@ -25,14 +27,23 @@ const STEPS = {
   HANDED_OFF_TO_HUMAN: 'HANDED_OFF_TO_HUMAN',
 };
 
+const WELCOME_MESSAGE = 'Hola, soy el asistente del taller. Te voy a ayudar a sacar tu turno. ¿Te parece?';
+const DECLINED_MESSAGE = 'Está bien. Si querés sacar un turno más adelante, escribime "sí" o "turno".';
+const ASK_DETAILS_MESSAGE = 'Perfecto. Contame tu nombre y si necesitás una revisión simple, una reparación intermedia o ver un problema complejo. Si tenés preferencia de día u horario, también podés decirla.';
+const ASK_NAME_MESSAGE = 'Perfecto, anotado. ¿Me dirías tu nombre?';
+
 function isAffirmative(text) {
   const n = normalize(text);
-  return ['si', 'sí', 'claro', 'dale', 'ok', 'okay', 'va', 'sip', 'obvio', 'puede', 'se puede'].some((w) => n.includes(w));
+  const words = n.split(/\W+/).filter(Boolean);
+  return ['si', 'claro', 'dale', 'ok', 'okay', 'va', 'sip', 'obvio'].some((w) => words.includes(w))
+    || n.includes('se puede');
 }
 
 function isNegative(text) {
   const n = normalize(text);
-  return ['no', 'nop', 'jamas', 'imposible', 'parado', 'no anda', 'no arranca', 'no se puede'].some((w) => n.includes(w));
+  const words = n.split(/\W+/).filter(Boolean);
+  return ['no', 'nop', 'jamas', 'imposible', 'parado'].some((w) => words.includes(w))
+    || ['no anda', 'no arranca', 'no se puede'].some((w) => n.includes(w));
 }
 
 function parsePreferredDate(text) {
@@ -68,6 +79,55 @@ function parsePreferredDate(text) {
   return null;
 }
 
+function cleanName(text) {
+  return text
+    .trim()
+    .replace(/^(me llamo|mi nombre es|soy|nombre)\s*:?\s+/i, '')
+    .replace(/\s+/g, ' ')
+    .slice(0, 80);
+}
+
+async function analyzeIncoming(text, conv) {
+  return aiService.analyzeMessage({
+    text,
+    step: conv.step,
+    todayISO: now().toISODate(),
+    timezone: TZ,
+    offeredSlots: (conv.data.offeredSlots || []).map((slot, index) => ({
+      number: index + 1,
+      startISO: slot.startISO,
+      label: formatHuman(DateTime.fromISO(slot.startISO, { zone: TZ })),
+    })),
+  });
+}
+
+function durationFromComplexity(complexity) {
+  if (complexity === 'simple') return { hours: 2, complexity: 'simple' };
+  if (complexity === 'medio') return { hours: 4, complexity: 'medio' };
+  if (complexity === 'complejo') return { hours: 8, complexity: 'complejo' };
+  return { hours: null, complexity: null };
+}
+
+async function offerSlots(conv, { preferredDate = null, timeOfDay = null } = {}) {
+  conv.data.preferredDate = preferredDate;
+  conv.data.preferredTimeOfDay = timeOfDay;
+
+  const slots = await calendarService.findAvailableSlots(
+    conv.data.durationHours,
+    preferredDate,
+    3,
+    { timeOfDay },
+  );
+
+  if (!slots.length) return null;
+
+  conv.data.offeredSlots = slots.map((s) => ({ startISO: s.start.toISO(), endISO: s.end.toISO() }));
+  conv.step = STEPS.CONFIRM_SLOT;
+
+  const lines = slots.map((s, i) => `${i + 1}. ${formatHuman(s.start)}`);
+  return `Genial, tengo estos horarios disponibles:\n${lines.join('\n')}\n\nRespondé con el número de la opción que preferís. Si necesitás otro día u horario, decime cuál.`;
+}
+
 async function processMessage(phone, text) {
   const conv = store.getOrCreate(phone);
   store.addMessage(phone, 'user', text);
@@ -93,8 +153,8 @@ async function processMessage(phone, text) {
     if (isAffirmative(text) || normalize(text).includes('turno') || normalize(text).includes('hola')) {
       store.reset(phone);
       const fresh = store.getOrCreate(phone);
-      fresh.step = STEPS.ASK_NAME;
-      const reply = 'Hola de nuevo. ¿A nombre de quién sería el nuevo turno?';
+      fresh.step = STEPS.ASK_CONSENT;
+      const reply = WELCOME_MESSAGE;
       store.addMessage(phone, 'bot', reply);
       return reply;
     }
@@ -107,15 +167,43 @@ async function processMessage(phone, text) {
 
   switch (conv.step) {
     case STEPS.START: {
-      conv.step = STEPS.ASK_NAME;
-      reply = 'Hola, soy el asistente del taller. Te voy a ayudar a sacar un turno. ¿Cuál es tu nombre?';
+      conv.step = STEPS.ASK_CONSENT;
+      reply = WELCOME_MESSAGE;
+      break;
+    }
+
+    case STEPS.ASK_CONSENT: {
+      const ai = await analyzeIncoming(text, conv);
+      const denied = ai.consent === false || ai.intent === 'deny' || (isNegative(text) && !isAffirmative(text));
+      if (denied) {
+        conv.status = 'completed';
+        conv.step = STEPS.COMPLETED;
+        reply = DECLINED_MESSAGE;
+        break;
+      }
+
+      conv.step = STEPS.ASK_COMPLEXITY;
+      reply = ASK_DETAILS_MESSAGE;
       break;
     }
 
     case STEPS.ASK_NAME: {
-      conv.data.name = text.trim().slice(0, 80);
-      conv.step = STEPS.ASK_VEHICLE;
-      reply = `Gracias ${conv.data.name}. ¿Qué vehículo tenés? Podés decirme marca, modelo y año.`;
+      const ai = await analyzeIncoming(text, conv);
+      const name = cleanName(ai.name || text);
+      if (!name) {
+        reply = 'No llegué a leer tu nombre. ¿Me lo repetís?';
+        break;
+      }
+
+      conv.data.name = name;
+
+      reply = await offerSlots(conv, {
+        preferredDate: ai.preferredDate || conv.data.preferredDate,
+        timeOfDay: ai.timeOfDay || conv.data.preferredTimeOfDay,
+      });
+      if (!reply) {
+        reply = 'No encontré horarios disponibles cercanos. ¿Querés probar más tarde?';
+      }
       break;
     }
 
@@ -156,15 +244,31 @@ async function processMessage(phone, text) {
     }
 
     case STEPS.ASK_COMPLEXITY: {
-      const c = classifyByLevel(text);
+      const ai = await analyzeIncoming(text, conv);
+      const c = ai.complexity ? durationFromComplexity(ai.complexity) : classifyByLevel(text);
       if (!c.hours) {
-        reply = 'Disculpá, no entendí. ¿Lo dirías como simple, intermedio o complejo?';
+        reply = 'Disculpá, no entendí. Contame si es una revisión simple, una reparación intermedia o un problema complejo.';
         break;
       }
       conv.data.durationHours = c.hours;
       conv.data.complexity = c.complexity;
-      conv.step = STEPS.ASK_PREFERRED_DATE;
-      reply = `Anotado. Te reservo un turno ${describeDuration(c)}. ¿Tenés preferencia de día?`;
+      conv.data.problemDescription = complexityLabel(c.complexity);
+      conv.data.preferredDate = ai.preferredDate || null;
+      conv.data.preferredTimeOfDay = ai.timeOfDay || null;
+
+      if (ai.name) {
+        conv.data.name = cleanName(ai.name);
+        reply = await offerSlots(conv, {
+          preferredDate: conv.data.preferredDate,
+          timeOfDay: conv.data.preferredTimeOfDay,
+        });
+        if (!reply) {
+          reply = 'No encontré horarios disponibles con esa preferencia. ¿Querés probar con otro día u horario?';
+        }
+      } else {
+        conv.step = STEPS.ASK_NAME;
+        reply = ASK_NAME_MESSAGE;
+      }
       break;
     }
 
@@ -193,9 +297,26 @@ async function processMessage(phone, text) {
     }
 
     case STEPS.CONFIRM_SLOT: {
-      const idx = parseInt(text.trim(), 10);
+      const ai = await analyzeIncoming(text, conv);
+      if (ai.intent === 'request_other_slots') {
+        const preferredDate = ai.preferredDate || conv.data.preferredDate;
+        const timeOfDay = ai.timeOfDay || conv.data.preferredTimeOfDay;
+
+        if (!preferredDate && !timeOfDay) {
+          reply = 'Dale. ¿Qué día u horario te quedaría mejor?';
+          break;
+        }
+
+        reply = await offerSlots(conv, { preferredDate, timeOfDay });
+        if (!reply) {
+          reply = 'No encontré horarios libres para esa preferencia. ¿Querés decirme otro día u otra franja horaria?';
+        }
+        break;
+      }
+
+      const idx = ai.selectedSlotNumber || parseInt(text.trim(), 10);
       if (!idx || idx < 1 || idx > conv.data.offeredSlots.length) {
-        reply = 'No reconocí la opción. Respondé con el número (1, 2 o 3).';
+        reply = 'No reconocí la opción. Respondé con el número (1, 2 o 3), o decime otro día u horario que te sirva.';
         break;
       }
       const chosen = conv.data.offeredSlots[idx - 1];
@@ -207,8 +328,15 @@ async function processMessage(phone, text) {
         conv.step = STEPS.COMPLETED;
 
         const start = DateTime.fromISO(chosen.startISO, { zone: TZ });
-        reply = `Listo ${conv.data.name}, tu turno quedó confirmado para el ${formatHuman(start)}. Duración estimada: ${conv.data.durationHours} horas. Vehículo: ${conv.data.vehicle}.`;
-        if (event?.htmlLink) reply += `\nReferencia: ${event.htmlLink}`;
+        const reservationData = [
+          `Nombre: ${conv.data.name}`,
+          `Turno: ${formatHuman(start)}`,
+          `Tipo: ${complexityLabel(conv.data.complexity)}`,
+          `Duración estimada: ${conv.data.durationHours} horas`,
+        ];
+
+        reply = `Listo! Agendado.\n\nDatos de la reserva:\n${reservationData.join('\n')}\n\nMuchas gracias y lo esperamos!`;
+        if (event?.htmlLink) reply += `\nLink: ${event.htmlLink}`;
       } catch (err) {
         if (err.code === 'SLOT_TAKEN') {
           // refrescar slots
@@ -216,6 +344,7 @@ async function processMessage(phone, text) {
             conv.data.durationHours,
             conv.data.preferredDate,
             3,
+            { timeOfDay: conv.data.preferredTimeOfDay },
           );
           conv.data.offeredSlots = slots.map((s) => ({ startISO: s.start.toISO(), endISO: s.end.toISO() }));
           const lines = slots.map((s, i) => `${i + 1}. ${formatHuman(s.start)}`);
@@ -241,6 +370,13 @@ async function processMessage(phone, text) {
 function describeDuration({ hours, complexity }) {
   const label = complexity === 'simple' ? 'corto' : complexity === 'medio' ? 'intermedio' : 'largo';
   return `${label} de ${hours} horas`;
+}
+
+function complexityLabel(complexity) {
+  if (complexity === 'simple') return 'Revisión simple';
+  if (complexity === 'medio') return 'Reparación intermedia';
+  if (complexity === 'complejo') return 'Problema complejo';
+  return 'No especificado';
 }
 
 module.exports = { processMessage, STEPS };

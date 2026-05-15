@@ -45,6 +45,11 @@ const env = {
     calendarId: process.env.GOOGLE_CALENDAR_ID,
   },
 
+  openai: {
+    apiKey: process.env.OPENAI_KEY || process.env.OPENAI_API_KEY,
+    model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+  },
+
   schedule: {
     workStartHour: process.env.WORK_START_HOUR || '08:00',
     workEndHour: process.env.WORK_END_HOUR || '18:00',
