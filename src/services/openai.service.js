@@ -8,6 +8,7 @@ const DEFAULT_RESULT = {
   intent: 'unknown',
   consent: null,
   name: null,
+  problemDescription: null,
   complexity: null,
   selectedSlotNumber: null,
   preferredDate: null,
@@ -34,8 +35,10 @@ async function analyzeMessage({ text, step, todayISO, timezone, offeredSlots = [
             content: [
               'Sos un clasificador para un bot de WhatsApp de un taller mecanico en Argentina.',
               'Devolves solo JSON valido, sin markdown.',
-              'Extrae intencion, nombre, complejidad del trabajo, seleccion de turno y preferencia de fecha/franja.',
+              'Extrae intencion, nombre, descripcion del problema, complejidad estimada del trabajo, seleccion de turno y preferencia de fecha/franja.',
               'Complejidad valida: simple, medio, complejo.',
+              'No le pidas al cliente que estime la complejidad: inferila por el problema descrito.',
+              'Ejemplos: frenos, suspension, embrague o aire acondicionado suelen ser medio; motor, caja, no arranca o vehiculo parado suelen ser complejo; aceite, filtros, luces o revision general suelen ser simple.',
               'timeOfDay valido: morning, afternoon, evening.',
               'preferredDate debe ser YYYY-MM-DD o null, usando la fecha actual como referencia.',
               'Si el usuario pide otro dia u horario, intent debe ser request_other_slots.',
@@ -79,6 +82,7 @@ async function analyzeMessage({ text, step, todayISO, timezone, offeredSlots = [
                 },
                 consent: { type: ['boolean', 'null'] },
                 name: { type: ['string', 'null'] },
+                problemDescription: { type: ['string', 'null'] },
                 complexity: { type: ['string', 'null'], enum: ['simple', 'medio', 'complejo', null] },
                 selectedSlotNumber: { type: ['number', 'null'], enum: [1, 2, 3, null] },
                 preferredDate: {
@@ -91,6 +95,7 @@ async function analyzeMessage({ text, step, todayISO, timezone, offeredSlots = [
                 'intent',
                 'consent',
                 'name',
+                'problemDescription',
                 'complexity',
                 'selectedSlotNumber',
                 'preferredDate',
@@ -131,6 +136,7 @@ function normalizeResult(result, fallback = DEFAULT_RESULT) {
     ], fallback.intent),
     consent: typeof result.consent === 'boolean' ? result.consent : fallback.consent,
     name: cleanString(result.name) || fallback.name,
+    problemDescription: cleanString(result.problemDescription) || fallback.problemDescription,
     complexity: pick(result.complexity, ['simple', 'medio', 'complejo'], fallback.complexity),
     selectedSlotNumber: normalizeSlotNumber(result.selectedSlotNumber) || fallback.selectedSlotNumber,
     preferredDate: /^\d{4}-\d{2}-\d{2}$/.test(result.preferredDate || '') ? result.preferredDate : fallback.preferredDate,
@@ -143,16 +149,17 @@ function fallbackAnalyze(text = '') {
   const words = n.split(/\W+/).filter(Boolean);
   const selectedSlotNumber = normalizeSlotNumber(text.match(/\b[1-3]\b/)?.[0]);
   const preferredDate = parseFallbackDate(text);
+  const name = extractFallbackName(text);
 
   let complexity = null;
-  if (n.includes('complejo') || n.includes('grave') || n.includes('grande')) complexity = 'complejo';
-  else if (n.includes('intermed') || n.includes('medio') || n.includes('moderad')) complexity = 'medio';
-  else if (n.includes('simple') || n.includes('revision') || n.includes('revisión') || n.includes('basic')) complexity = 'simple';
+  if (n.includes('motor') || n.includes('caja') || n.includes('no arranca') || n.includes('no anda') || n.includes('complejo') || n.includes('grave') || n.includes('grande')) complexity = 'complejo';
+  else if (n.includes('freno') || n.includes('frenos') || n.includes('embrague') || n.includes('suspension') || n.includes('tren delantero') || n.includes('aire acondicionado') || n.includes('intermed') || n.includes('medio') || n.includes('moderad')) complexity = 'medio';
+  else if (n.includes('aceite') || n.includes('filtro') || n.includes('luces') || n.includes('bateria') || n.includes('revision') || n.includes('revisión') || n.includes('simple') || n.includes('basic')) complexity = 'simple';
 
   let timeOfDay = null;
   if (n.includes('tarde')) timeOfDay = 'afternoon';
   else if (n.includes('noche') || n.includes('ultima hora') || n.includes('última hora')) timeOfDay = 'evening';
-  else if (n.includes('por la manana') || n.includes('a la manana')) timeOfDay = 'morning';
+  else if (n.includes('por la manana') || n.includes('a la manana') || n.includes('durante la manana')) timeOfDay = 'morning';
 
   const asksOtherSlots = [
     'otro dia',
@@ -174,15 +181,36 @@ function fallbackAnalyze(text = '') {
     intent: selectedSlotNumber ? 'select_slot'
       : asksOtherSlots ? 'request_other_slots'
         : complexity ? 'provide_complexity'
+          : name ? 'provide_details'
           : affirms ? 'affirm'
             : denies ? 'deny'
               : 'unknown',
     consent: affirms ? true : denies ? false : null,
+    name,
+    problemDescription: stripKnownPreferenceParts(text),
     complexity,
     selectedSlotNumber,
     preferredDate,
     timeOfDay,
   };
+}
+
+function extractFallbackName(text) {
+  const compact = text.trim().replace(/\s+/g, ' ');
+  const match = compact.match(/(?:me llamo|mi nombre es|soy|nombre)\s*:?\s+([a-záéíóúñü]+(?:\s+[a-záéíóúñü]+){0,3})/i);
+  if (!match) return null;
+
+  return match[1]
+    .replace(/\b(se|me|rompio|rompieron|rompió|rompieron|prefiero|tengo|necesito)\b.*$/i, '')
+    .replace(/[.,;:]+$/g, '')
+    .trim() || null;
+}
+
+function stripKnownPreferenceParts(text) {
+  return text
+    .replace(/(?:me llamo|mi nombre es|soy|nombre)\s*:?\s+[^\n.]+[.\n]?/i, '')
+    .replace(/prefiero[\s\S]*$/i, '')
+    .trim() || null;
 }
 
 function parseFallbackDate(text) {

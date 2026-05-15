@@ -29,7 +29,7 @@ const STEPS = {
 
 const WELCOME_MESSAGE = 'Hola, soy el asistente del taller. Te voy a ayudar a sacar tu turno. ¿Te parece?';
 const DECLINED_MESSAGE = 'Está bien. Si querés sacar un turno más adelante, escribime "sí" o "turno".';
-const ASK_DETAILS_MESSAGE = 'Perfecto. Contame tu nombre y si necesitás una revisión simple, una reparación intermedia o ver un problema complejo. Si tenés preferencia de día u horario, también podés decirla.';
+const ASK_DETAILS_MESSAGE = 'Perfecto. Contame tu nombre, qué le pasa al auto y si tenés preferencia de día u horario.';
 const ASK_NAME_MESSAGE = 'Perfecto, anotado. ¿Me dirías tu nombre?';
 
 function isAffirmative(text) {
@@ -80,11 +80,16 @@ function parsePreferredDate(text) {
 }
 
 function cleanName(text) {
-  return text
+  const normalizedText = text
     .trim()
     .replace(/^(me llamo|mi nombre es|soy|nombre)\s*:?\s+/i, '')
     .replace(/\s+/g, ' ')
     .slice(0, 80);
+
+  return normalizedText
+    .replace(/\b(ya te lo dije antes|te lo dije antes|ya te lo dije|es)\b\.?\s*/i, '')
+    .replace(/[.,;:]+$/g, '')
+    .trim();
 }
 
 async function analyzeIncoming(text, conv) {
@@ -106,6 +111,40 @@ function durationFromComplexity(complexity) {
   if (complexity === 'medio') return { hours: 4, complexity: 'medio' };
   if (complexity === 'complejo') return { hours: 8, complexity: 'complejo' };
   return { hours: null, complexity: null };
+}
+
+function detectDurationFromDetails(text, ai) {
+  if (ai.complexity) return durationFromComplexity(ai.complexity);
+
+  const problemDescription = ai.problemDescription || text;
+  if (!hasMeaningfulProblemDescription(problemDescription)) {
+    return { hours: null, complexity: null, reason: 'missing_problem_description' };
+  }
+
+  const duration = calculateAppointmentDuration(problemDescription, null);
+  if (duration.hours) return duration;
+
+  return { hours: 4, complexity: 'medio', reason: 'default_unknown_problem' };
+}
+
+function hasMeaningfulProblemDescription(text = '') {
+  const n = normalize(text);
+  if (!n || n.length < 8) return false;
+  return !['no se', 'nose', 'no sabria', 'no tengo idea'].includes(n);
+}
+
+function mergeConversationDetails(conv, text, ai) {
+  if (ai.name) conv.data.name = cleanName(ai.name);
+
+  const problemDescription = ai.problemDescription || text.trim();
+  if (problemDescription) conv.data.problemDescription = problemDescription.slice(0, 500);
+
+  if (ai.preferredDate) conv.data.preferredDate = ai.preferredDate;
+  if (ai.timeOfDay) conv.data.preferredTimeOfDay = ai.timeOfDay;
+
+  const duration = detectDurationFromDetails(problemDescription, ai);
+  conv.data.durationHours = duration.hours;
+  conv.data.complexity = duration.complexity;
 }
 
 async function offerSlots(conv, { preferredDate = null, timeOfDay = null } = {}) {
@@ -245,19 +284,14 @@ async function processMessage(phone, text) {
 
     case STEPS.ASK_COMPLEXITY: {
       const ai = await analyzeIncoming(text, conv);
-      const c = ai.complexity ? durationFromComplexity(ai.complexity) : classifyByLevel(text);
-      if (!c.hours) {
-        reply = 'Disculpá, no entendí. Contame si es una revisión simple, una reparación intermedia o un problema complejo.';
+      mergeConversationDetails(conv, text, ai);
+
+      if (!conv.data.durationHours) {
+        reply = 'No hay problema. Contame brevemente qué le pasa al auto o qué servicio necesitás, y yo calculo cuánto tiempo reservar.';
         break;
       }
-      conv.data.durationHours = c.hours;
-      conv.data.complexity = c.complexity;
-      conv.data.problemDescription = complexityLabel(c.complexity);
-      conv.data.preferredDate = ai.preferredDate || null;
-      conv.data.preferredTimeOfDay = ai.timeOfDay || null;
 
-      if (ai.name) {
-        conv.data.name = cleanName(ai.name);
+      if (conv.data.name) {
         reply = await offerSlots(conv, {
           preferredDate: conv.data.preferredDate,
           timeOfDay: conv.data.preferredTimeOfDay,
@@ -267,7 +301,7 @@ async function processMessage(phone, text) {
         }
       } else {
         conv.step = STEPS.ASK_NAME;
-        reply = ASK_NAME_MESSAGE;
+        reply = 'Perfecto, ya tengo el problema. ¿Me dirías tu nombre?';
       }
       break;
     }
